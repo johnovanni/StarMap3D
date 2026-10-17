@@ -1,0 +1,66 @@
+name: Release
+
+# Builds a self-contained Windows x64 zip.
+# Pull requests: the zip is uploaded as a workflow artifact so the build can be checked.
+# Version tags (v1.0.0): the zip and its SHA-256 checksum are attached to a GitHub Release,
+# which qapow.com links to as releases/latest/download/StarMap3D-win-x64.zip.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: StarMap3D.csproj
+  ZIP: StarMap3D-win-x64.zip
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish
+        run: dotnet publish $env:PROJECT -c Release -r win-x64 --self-contained true  -o publish
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish\* -DestinationPath $env:ZIP
+          $hash = (Get-FileHash $env:ZIP -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:ZIP" | Out-File "$env:ZIP.sha256" -Encoding ascii -NoNewline
+          Get-Item $env:ZIP | Select-Object Name, Length
+
+      - name: Upload build
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarMap3D-win-x64
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $env:ZIP "$env:ZIP.sha256" --clobber
+          } else {
+            gh release create $tag $env:ZIP "$env:ZIP.sha256" --title "$tag" --generate-notes
+          }
