@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # lets the signing step log in to Azure without a stored password
 
 env:
   PROJECT: StarMap3D.csproj
@@ -23,6 +24,8 @@ jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 30
+    # Tag builds run in the "signing" environment, which the Azure login trusts. Other builds run without it.
+    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'signing' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +36,53 @@ jobs:
 
       - name: Publish
         run: dotnet publish $env:PROJECT -c Release -r win-x64 --self-contained true  -o publish
+
+      # Code signing with Azure Artifact Signing, so Windows SmartScreen shows the publisher instead of
+      # "Windows protected your PC". Runs on version tags once the repository variables below are set;
+      # until then releases stay unsigned. Setup: docs/code-signing.md.
+      - name: Find files to sign
+        id: tosign
+        if: startsWith(github.ref, 'refs/tags/') && vars.SIGNING_ACCOUNT != ''
+        shell: pwsh
+        run: |
+          # Only files with no signature yet: our own exe and DLLs, not the Microsoft-signed runtime.
+          $files = Get-ChildItem publish -Recurse -Include *.exe, *.dll |
+            Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -eq 'NotSigned' } |
+            ForEach-Object FullName
+          $files
+          "files=$($files -join ',')" >> $env:GITHUB_OUTPUT
+
+      - name: Azure login
+        if: steps.tosign.outcome == 'success'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign
+        if: steps.tosign.outcome == 'success'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: ${{ steps.tosign.outputs.files }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: ${{ github.event.repository.name }}
+          description-url: https://qapow.com
+
+      - name: Check signature
+        if: steps.tosign.outcome == 'success'
+        shell: pwsh
+        run: |
+          $bad = Get-ChildItem publish -Recurse -Include *.exe |
+            Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+          if ($bad) { $bad | ForEach-Object { Write-Error "Not signed: $($_.Name)" }; exit 1 }
+          Get-AuthenticodeSignature (Get-ChildItem publish -Include *.exe -Recurse) |
+            Select-Object @{n='File';e={Split-Path $_.Path -Leaf}}, Status, @{n='Signer';e={$_.SignerCertificate.Subject}}
 
       - name: Zip
         shell: pwsh
