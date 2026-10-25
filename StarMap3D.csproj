@@ -9,6 +9,11 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <AssemblyName>StarMap3D</AssemblyName>
     <RootNamespace>StarMap3D</RootNamespace>
+    <ApplicationIcon>Assets\StarMap3D.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\StarMap3D.ico" />
+  </ItemGroup>
 
 </Project>
