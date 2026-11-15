@@ -1,9 +1,17 @@
 name: Release
 
 # Builds a self-contained Windows x64 zip.
-# Pull requests: the zip is uploaded as a workflow artifact so the build can be checked.
+# Pull requests: the zip is uploaded as a workflow artifact so the build can be checked (unsigned).
 # Version tags (v1.0.0): the zip and its SHA-256 checksum are attached to a GitHub Release,
 # which qapow.com links to as releases/latest/download/StarMap3D-win-x64.zip.
+#
+# Tag and manual runs sign the app's .exe and its own DLLs with Azure Artifact Signing
+# (account JohnApolloni, profile JohnApolloniPublic), the same setup VoiceCoach uses.
+# They run in the "release" environment and sign in to Azure with GitHub's OIDC token, which needs
+# repository variables AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID, and an Entra app
+# with a federated credential for the "release" environment that holds the "Artifact Signing
+# Certificate Profile Signer" role on the account. With GitHub's immutable OIDC subject, the
+# credential's subject is repo:johnovanni@11181099/StarMap3D@1413520932:environment:release.
 
 on:
   push:
@@ -14,15 +22,20 @@ on:
 
 permissions:
   contents: write
+  id-token: write # OIDC sign-in to Azure for code signing
 
 env:
   PROJECT: StarMap3D.csproj
   ZIP: StarMap3D-win-x64.zip
+  # Pull request builds skip signing, so they never need Azure access.
+  SIGN: ${{ github.event_name != 'pull_request' }}
 
 jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 30
+    # The Azure federated credential trusts this environment, so only runs that use it can sign.
+    environment: ${{ github.event_name != 'pull_request' && 'release' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +46,39 @@ jobs:
 
       - name: Publish
         run: dotnet publish $env:PROJECT -c Release -r win-x64 --self-contained true  -o publish
+
+      - name: Sign in to Azure
+        if: env.SIGN == 'true'
+        uses: azure/login@v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Signs only the files we build; third-party DLLs keep their publishers' signatures.
+      - name: Sign
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: https://cus.codesigning.azure.net/
+          signing-account-name: JohnApolloni
+          certificate-profile-name: JohnApolloniPublic
+          files: |
+            ${{ github.workspace }}\publish\StarMap3D.exe
+            ${{ github.workspace }}\publish\StarMap3D.dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signatures
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $bad = 'StarMap3D.exe', 'StarMap3D.dll' |
+            ForEach-Object { Get-AuthenticodeSignature "publish\$_" } |
+            Where-Object Status -ne 'Valid'
+          if ($bad) { $bad | Format-Table Path, Status, StatusMessage; throw 'Signature check failed.' }
+          (Get-AuthenticodeSignature publish\StarMap3D.exe).SignerCertificate.Subject
 
       - name: Zip
         shell: pwsh
