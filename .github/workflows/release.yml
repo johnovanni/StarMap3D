@@ -1,11 +1,13 @@
 name: Release
 
-# Builds a self-contained Windows x64 zip.
-# Pull requests: the zip is uploaded as a workflow artifact so the build can be checked (unsigned).
-# Version tags (v1.0.0): the zip and its SHA-256 checksum are attached to a GitHub Release,
-# which qapow.com links to as releases/latest/download/StarMap3D-win-x64.zip.
+# Builds a signed Windows installer, StarMap3D-Setup.exe, that puts the app in C:\Program Files\Qapow\StarMap3D
+# by default (the user can pick another folder; the script is packaging/installer/StarMap3D.iss),
+# plus the same self-contained Windows x64 zip as before, for people who'd rather not install.
+# Pull requests: the installer and zip are uploaded as a workflow artifact so the build can be checked (unsigned).
+# Version tags (v1.0.0): both files and their SHA-256 checksums are attached to a GitHub Release,
+# which qapow.com links to as releases/latest/download/StarMap3D-Setup.exe (or StarMap3D-win-x64.zip).
 #
-# Tag and manual runs sign the app's .exe and its own DLLs with Azure Artifact Signing
+# Tag and manual runs sign the app's .exe and its own DLLs, then the installer, with Azure Artifact Signing
 # (account JohnApolloni, profile JohnApolloniPublic), the same setup VoiceCoach uses.
 # They run in the "release" environment and sign in to Azure with GitHub's OIDC token, which needs
 # repository variables AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID, and an Entra app
@@ -17,7 +19,7 @@ on:
   push:
     tags: ['v*']
   pull_request:
-    paths: ['.github/workflows/release.yml']
+    paths: ['.github/workflows/release.yml', 'packaging/installer/**']
   workflow_dispatch:
 
 permissions:
@@ -27,6 +29,7 @@ permissions:
 env:
   PROJECT: StarMap3D.csproj
   ZIP: StarMap3D-win-x64.zip
+  SETUP: StarMap3D-Setup.exe
   # Pull request builds skip signing, so they never need Azure access.
   SIGN: ${{ github.event_name != 'pull_request' }}
 
@@ -80,13 +83,53 @@ jobs:
           if ($bad) { $bad | Format-Table Path, Status, StatusMessage; throw 'Signature check failed.' }
           (Get-AuthenticodeSignature publish\StarMap3D.exe).SignerCertificate.Subject
 
-      - name: Zip
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # The installer's version comes from the tag (v1.2.3 -> 1.2.3); other runs build 0.0.0.
+          $version = '0.0.0'
+          if ('${{ github.ref_type }}' -eq 'tag') { $version = '${{ github.ref_name }}'.TrimStart('v') }
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue
+          }
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y | Out-Null
+            $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc.Source "/DAppVersion=$version" "/DPublishDir=$PWD\publish" "/DOutputDir=$PWD\out" packaging\installer\StarMap3D.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
+
+      - name: Sign installer
+        if: env.SIGN == 'true'
+        uses: Azure/artifact-signing-action@v2.0.0
+        with:
+          endpoint: https://cus.codesigning.azure.net/
+          signing-account-name: JohnApolloni
+          certificate-profile-name: JohnApolloniPublic
+          files: ${{ github.workspace }}\out\${{ env.SETUP }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify installer signature
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "out\$env:SETUP"
+          if ($sig.Status -ne 'Valid') { $sig | Format-Table Path, Status, StatusMessage; throw 'Installer signature check failed.' }
+          $sig.SignerCertificate.Subject
+
+      - name: Zip and checksums
         shell: pwsh
         run: |
           Compress-Archive -Path publish\* -DestinationPath $env:ZIP
           $hash = (Get-FileHash $env:ZIP -Algorithm SHA256).Hash.ToLower()
           "$hash  $env:ZIP" | Out-File "$env:ZIP.sha256" -Encoding ascii -NoNewline
-          Get-Item $env:ZIP | Select-Object Name, Length
+          Move-Item "out\$env:SETUP" $env:SETUP
+          $hash = (Get-FileHash $env:SETUP -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:SETUP" | Out-File "$env:SETUP.sha256" -Encoding ascii -NoNewline
+          Get-Item $env:ZIP, $env:SETUP | Select-Object Name, Length
 
       - name: Upload build
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -94,6 +137,8 @@ jobs:
         with:
           name: StarMap3D-win-x64
           path: |
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
             ${{ env.ZIP }}
             ${{ env.ZIP }}.sha256
 
@@ -104,9 +149,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $files = $env:SETUP, "$env:SETUP.sha256", $env:ZIP, "$env:ZIP.sha256"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $env:ZIP "$env:ZIP.sha256" --clobber
+            gh release upload $tag @files --clobber
           } else {
-            gh release create $tag $env:ZIP "$env:ZIP.sha256" --title "$tag" --generate-notes
+            gh release create $tag @files --title "$tag" --generate-notes
           }
